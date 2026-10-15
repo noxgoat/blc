@@ -4,6 +4,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const fetch = require('node-fetch');
 const path = require('path');
+const auth = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,7 +12,6 @@ const PORT = process.env.PORT || 3000;
 // ──────────────────────────────────────────
 // URLs base da API oficial do CNJ/BNMP
 // ──────────────────────────────────────────
-const BNMP_AUTH_URL  = 'https://portalbnmp.cnj.jus.br/bnmpportal/api/authenticate';
 const BNMP_BASE_URL  = 'https://portalbnmp.cnj.jus.br/scaservice/api';
 const BNMP_PESQ_URL  = 'https://portalbnmp.cnj.jus.br/bnmpportal/api';
 
@@ -33,62 +33,21 @@ const limiter = rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true, l
 app.use(limiter);
 
 // ──────────────────────────────────────────
-// Armazenamento em memória das credenciais e sessão
-// (em produção use Redis ou banco de dados)
+// Helper: fetch autenticado via auth.js (Playwright)
 // ──────────────────────────────────────────
-let SESSION = {
-  token: null,
-  expiresAt: 0,
-  credentials: { username: null, password: null }
-};
-
-// ──────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────
-function isTokenValid() {
-  return SESSION.token && Date.now() < SESSION.expiresAt;
-}
-
-async function getToken() {
-  if (isTokenValid()) return SESSION.token;
-  if (!SESSION.credentials.username || !SESSION.credentials.password) {
-    throw new Error('Credenciais não configuradas. Configure na aba "Configurações".');
-  }
-  return await doLogin(SESSION.credentials.username, SESSION.credentials.password);
-}
-
-async function doLogin(username, password) {
-  const res = await fetch(BNMP_AUTH_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({ username, password })
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`Login recusado pelo CNJ (${res.status}): ${txt.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-  const token = data.id_token || data.token || data.access_token;
-  if (!token) throw new Error('Token não encontrado na resposta do CNJ.');
-
-  SESSION.token = token;
-  SESSION.expiresAt = Date.now() + 3_600_000; // 1h
-  return token;
-}
-
 async function cnjFetch(url, opts = {}) {
-  const token = await getToken();
+  const headers = await auth.getHeaders();
   const res = await fetch(url, {
     ...opts,
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      ...(opts.headers || {})
-    }
+    headers: { ...headers, ...(opts.headers || {}) }
   });
+  // Se 401/403, tenta renovar o token uma vez
+  if (res.status === 401 || res.status === 403) {
+    console.log('[server] Token expirado, renovando...');
+    await auth.login();
+    const headers2 = await auth.getHeaders();
+    return fetch(url, { ...opts, headers: { ...headers2, ...(opts.headers || {}) } });
+  }
   return res;
 }
 
@@ -98,38 +57,50 @@ async function cnjFetch(url, opts = {}) {
 
 // --- Health check ---
 router.get('/health', (req, res) => {
-  res.json({ ok: true, tokenAtivo: isTokenValid(), ts: new Date().toISOString() });
+  const s = auth.getSession();
+  res.json({ ok: true, tokenAtivo: auth.isValid(), credenciaisConfiguradas: !!(s.credentials.username), ts: new Date().toISOString() });
 });
 
 // --- Salvar credenciais ---
 router.post('/config/credentials', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'username e password são obrigatórios.' });
-  SESSION.credentials = { username, password };
-  SESSION.token = null;
-  SESSION.expiresAt = 0;
-  res.json({ ok: true, message: 'Credenciais salvas. Token será renovado no próximo request.' });
+  auth.setCredentials(username, password);
+  res.json({ ok: true, message: 'Credenciais salvas. Login será feito automaticamente na próxima busca.' });
 });
 
 // --- Status das credenciais ---
 router.get('/config/credentials', (req, res) => {
+  const s = auth.getSession();
   res.json({
-    configured: !!(SESSION.credentials.username && SESSION.credentials.password),
-    username: SESSION.credentials.username || null,
-    tokenAtivo: isTokenValid()
+    configured: !!(s.credentials.username && s.credentials.password),
+    username: s.credentials.username || null,
+    tokenAtivo: auth.isValid()
   });
 });
 
-// --- Login manual (testa as credenciais salvas) ---
+// --- Login manual via navegador headless ---
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (username && password) {
-      SESSION.credentials = { username, password };
-      SESSION.token = null;
-    }
-    await doLogin(SESSION.credentials.username, SESSION.credentials.password);
-    res.json({ ok: true, message: 'Autenticado com sucesso no BNMP/CNJ.' });
+    res.json({ ok: true, message: 'Login iniciado via navegador headless. Isso pode levar até 30 segundos...' });
+    // Login em background para não travar o response
+    auth.login(username, password).then(() => {
+      console.log('[login] Login concluído com sucesso!');
+    }).catch(e => {
+      console.error('[login] Erro:', e.message);
+    });
+  } catch (e) {
+    res.status(401).json({ error: e.message });
+  }
+});
+
+// --- Login síncrono (aguarda completar) ---
+router.post('/login/sync', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    await auth.login(username, password);
+    res.json({ ok: true, message: 'Autenticado com sucesso no BNMP/CNJ via navegador real.' });
   } catch (e) {
     res.status(401).json({ error: e.message });
   }
@@ -137,8 +108,7 @@ router.post('/login', async (req, res) => {
 
 // --- Logout ---
 router.post('/logout', (req, res) => {
-  SESSION.token = null;
-  SESSION.expiresAt = 0;
+  auth.setCredentials(null, null);
   res.json({ ok: true });
 });
 
@@ -253,10 +223,11 @@ router.get('/mandado/:id/pdf', async (req, res) => {
 
 // --- Rota /me (compatibilidade com o painel) ---
 router.get('/me', (req, res) => {
+  const s = auth.getSession();
   res.json({
     user: {
       id: 'u1',
-      name: SESSION.credentials.username || 'Operador',
+      name: s.credentials.username || 'Operador',
       role: 'owner',
       credits: 999
     },
@@ -266,20 +237,20 @@ router.get('/me', (req, res) => {
 
 // --- Settings BNMP (credenciais salvas pelo painel) ---
 router.get('/settings/bnmp', (req, res) => {
+  const s = auth.getSession();
   res.json({
-    username: SESSION.credentials.username || '',
-    password: SESSION.credentials.password ? '••••••' : '',
+    username: s.credentials.username || '',
+    password: s.credentials.password ? '••••••' : '',
     proxyUrl: process.env.PROXY_URL || ''
   });
 });
 
 router.put('/settings/bnmp', (req, res) => {
-  const { username, password, proxyUrl } = req.body || {};
-  if (username) SESSION.credentials.username = username;
-  if (password && password !== '••••••') SESSION.credentials.password = password;
-  // Invalida token ao trocar credenciais
-  SESSION.token = null;
-  SESSION.expiresAt = 0;
+  const { username, password } = req.body || {};
+  const s = auth.getSession();
+  const newUser = username || s.credentials.username;
+  const newPass = (password && password !== '••••••') ? password : s.credentials.password;
+  auth.setCredentials(newUser, newPass);
   res.json({ ok: true });
 });
 
