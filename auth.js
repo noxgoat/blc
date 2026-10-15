@@ -1,14 +1,12 @@
 /**
- * auth.js — Login no BNMP via navegador headless (Playwright)
- * Abre o Chrome real, preenche CPF+senha, captura o token JWT e cookies de sessão.
+ * auth.js — Login no BNMP via Playwright (Chrome headless)
+ * Estratégias em cascata para capturar o token JWT.
  */
 
 const { chromium } = require('playwright');
 
 const PORTAL_URL = 'https://portalbnmp.cnj.jus.br';
-const LOGIN_URL  = `${PORTAL_URL}/bnmpportal/`;
 
-// Sessão em memória
 let SESSION = {
   token: null,
   cookies: [],
@@ -17,12 +15,10 @@ let SESSION = {
 };
 
 function isValid() {
-  return SESSION.token && Date.now() < SESSION.expiresAt;
+  return !!(SESSION.token && Date.now() < SESSION.expiresAt);
 }
 
-function getSession() {
-  return SESSION;
-}
+function getSession() { return SESSION; }
 
 function setCredentials(username, password) {
   SESSION.credentials = { username, password };
@@ -32,156 +28,248 @@ function setCredentials(username, password) {
 }
 
 /**
- * Faz login via navegador headless e captura o token JWT da resposta da API.
+ * Login via Chrome headless com múltiplas estratégias de captura de token.
  */
 async function login(username, password) {
-  if (username && password) setCredentials(username, password);
+  if (username !== undefined) SESSION.credentials.username = username || SESSION.credentials.username;
+  if (password !== undefined) SESSION.credentials.password = password || SESSION.credentials.password;
 
   const u = SESSION.credentials.username;
   const p = SESSION.credentials.password;
-  if (!u || !p) throw new Error('Credenciais não configuradas.');
+  if (!u || !p) throw new Error('Credenciais não configuradas. Configure na aba Configurações.');
 
-  console.log('[auth] Iniciando login via navegador headless...');
+  console.log('[auth] Iniciando login via Playwright...');
 
   const browser = await chromium.launch({
     headless: true,
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled'
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1280,800'
     ]
   });
-
-  let capturedToken = null;
 
   try {
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       locale: 'pt-BR',
-      timezoneId: 'America/Sao_Paulo'
+      timezoneId: 'America/Sao_Paulo',
+      viewport: { width: 1280, height: 800 }
     });
 
-    const page = await context.newPage();
+    let capturedToken = null;
 
-    // Intercepta respostas para capturar o token JWT
-    page.on('response', async (response) => {
+    // Estratégia 1: intercepta responses da API de auth
+    context.on('response', async (response) => {
+      if (capturedToken) return;
       const url = response.url();
-      if (url.includes('/authenticate') || url.includes('/login') || url.includes('/auth')) {
+      if (url.includes('authenticate') || url.includes('/auth') || url.includes('/login') || url.includes('/token')) {
         try {
           const ct = response.headers()['content-type'] || '';
-          if (ct.includes('application/json')) {
+          if (ct.includes('json')) {
             const body = await response.json().catch(() => null);
-            if (body && (body.id_token || body.token || body.access_token)) {
-              capturedToken = body.id_token || body.token || body.access_token;
-              console.log('[auth] Token capturado via interceptação!');
-            }
+            const t = body && (body.id_token || body.token || body.access_token || body.jwt);
+            if (t && t.startsWith('ey')) { capturedToken = t; console.log('[auth] ✅ Token via response interceptado'); }
           }
         } catch {}
       }
     });
 
-    // Também intercepta requests para pegar o Authorization header que o JS envia
-    page.on('request', (request) => {
-      const auth = request.headers()['authorization'];
-      if (auth && auth.startsWith('Bearer ') && auth.length > 50) {
-        capturedToken = auth.replace('Bearer ', '');
-        console.log('[auth] Token capturado via header de request!');
+    // Estratégia 2: intercepta requests com Authorization header
+    context.on('request', (req) => {
+      if (capturedToken) return;
+      const auth = req.headers()['authorization'] || '';
+      if (auth.startsWith('Bearer ey') && auth.length > 60) {
+        capturedToken = auth.slice(7);
+        console.log('[auth] ✅ Token via request header interceptado');
       }
     });
 
+    const page = await context.newPage();
+
     // Navega para o portal
-    await page.goto(LOGIN_URL, { waitUntil: 'networkidle', timeout: 30000 });
-    console.log('[auth] Portal carregado:', page.url());
+    console.log('[auth] Navegando para o portal...');
+    await page.goto(`${PORTAL_URL}/bnmpportal/`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    }).catch(() => {});
 
-    // Aguarda o formulário de login aparecer
-    await page.waitForSelector('input[type="text"], input[name="username"], input[id*="user"], input[placeholder*="CPF"], input[placeholder*="usuário"]', { timeout: 15000 });
+    await page.waitForTimeout(2000);
+    console.log('[auth] URL atual:', page.url());
 
-    // Preenche usuário
-    const userInput = await page.$('input[name="username"]') ||
-                      await page.$('input[id*="user"]') ||
-                      await page.$('input[placeholder*="CPF"]') ||
-                      await page.$('input[type="text"]:first-of-type');
+    // Aguarda campo de login aparecer
+    const userSelectors = [
+      'input[name="username"]',
+      'input[name="login"]',
+      'input[id="username"]',
+      'input[type="text"]',
+      'input[placeholder*="CPF"]',
+      'input[placeholder*="usuário"]',
+      'input[placeholder*="usuario"]',
+      'input[placeholder*="login"]'
+    ];
 
-    if (!userInput) throw new Error('Campo de usuário não encontrado na página de login.');
+    let userInput = null;
+    for (const sel of userSelectors) {
+      try {
+        await page.waitForSelector(sel, { timeout: 5000 });
+        userInput = await page.$(sel);
+        if (userInput) { console.log('[auth] Campo usuário encontrado:', sel); break; }
+      } catch {}
+    }
+
+    if (!userInput) {
+      // Tira screenshot para debug
+      const ss = await page.screenshot({ fullPage: false }).catch(() => null);
+      throw new Error(`Campo de usuário não encontrado. URL: ${page.url()}. Verifique se o portal está acessível.`);
+    }
+
+    // Preenche usuário (CPF)
     await userInput.click({ clickCount: 3 });
-    await userInput.type(u, { delay: 80 });
+    await userInput.fill('');
+    await userInput.type(u, { delay: 60 });
+    console.log('[auth] Usuário preenchido');
 
-    // Preenche senha
-    const passInput = await page.$('input[type="password"]');
+    // Aguarda campo de senha
+    const passSelectors = ['input[type="password"]', 'input[name="password"]', 'input[name="senha"]'];
+    let passInput = null;
+    for (const sel of passSelectors) {
+      passInput = await page.$(sel);
+      if (passInput) break;
+    }
     if (!passInput) throw new Error('Campo de senha não encontrado.');
+
     await passInput.click();
-    await passInput.type(p, { delay: 80 });
+    await passInput.fill('');
+    await passInput.type(p, { delay: 60 });
+    console.log('[auth] Senha preenchida');
 
     // Clica em entrar
-    const submitBtn = await page.$('button[type="submit"]') ||
-                      await page.$('input[type="submit"]') ||
-                      await page.$('button:has-text("Entrar")') ||
-                      await page.$('button:has-text("Login")');
+    const submitSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Entrar")',
+      'button:has-text("Login")',
+      'button:has-text("Acessar")',
+      '[class*="login"] button',
+      '[class*="btn-login"]',
+      '[class*="btn-entrar"]'
+    ];
 
-    if (!submitBtn) throw new Error('Botão de login não encontrado.');
-    await submitBtn.click();
-
-    // Aguarda navegação após login
-    await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
-
-    // Verifica se apareceu mensagem de erro
-    const errMsg = await page.$eval(
-      '[class*="error"], [class*="erro"], [class*="alert"], [id*="error"]',
-      el => el.textContent?.trim()
-    ).catch(() => null);
-
-    if (errMsg && errMsg.length > 3) {
-      throw new Error(`Login rejeitado: ${errMsg}`);
+    let submitted = false;
+    for (const sel of submitSelectors) {
+      try {
+        const btn = await page.$(sel);
+        if (btn) {
+          await btn.click();
+          submitted = true;
+          console.log('[auth] Botão clicado:', sel);
+          break;
+        }
+      } catch {}
     }
 
-    // Tenta pegar o token do localStorage/sessionStorage
+    if (!submitted) {
+      // Tenta Enter no campo senha
+      await passInput.press('Enter');
+      console.log('[auth] Enter pressionado no campo senha');
+    }
+
+    // Aguarda resultado do login
+    await page.waitForTimeout(5000);
+
+    // Verifica erros de login
+    const errorSelectors = [
+      '.error', '.erro', '.alert-danger', '[class*="error"]',
+      '[class*="invalid"]', '[class*="wrong"]', '[id*="error"]'
+    ];
+    for (const sel of errorSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (el) {
+          const txt = await el.textContent();
+          if (txt && txt.trim().length > 3) {
+            throw new Error(`Login rejeitado pelo CNJ: "${txt.trim()}"`);
+          }
+        }
+      } catch (e) {
+        if (e.message.includes('Login rejeitado')) throw e;
+      }
+    }
+
+    // Estratégia 3: busca token no localStorage/sessionStorage
     if (!capturedToken) {
       capturedToken = await page.evaluate(() => {
-        for (const key of Object.keys(localStorage)) {
-          const v = localStorage.getItem(key);
-          if (v && v.startsWith('ey') && v.split('.').length === 3) return v;
+        const stores = [localStorage, sessionStorage];
+        for (const store of stores) {
+          for (let i = 0; i < store.length; i++) {
+            const key = store.key(i);
+            const val = store.getItem(key);
+            if (val && val.startsWith('ey') && val.split('.').length === 3 && val.length > 100) {
+              console.log('Token encontrado no storage, chave:', key);
+              return val;
+            }
+            // Tenta parsear JSON
+            try {
+              const obj = JSON.parse(val);
+              const t = obj && (obj.id_token || obj.token || obj.access_token || obj.jwt);
+              if (t && typeof t === 'string' && t.startsWith('ey')) return t;
+            } catch {}
+          }
         }
-        for (const key of Object.keys(sessionStorage)) {
-          const v = sessionStorage.getItem(key);
-          if (v && v.startsWith('ey') && v.split('.').length === 3) return v;
-        }
-        // Tenta pegar de alguma variável global
-        return window.__token || window.authToken || window.jwtToken || null;
+        return null;
       });
-      if (capturedToken) console.log('[auth] Token capturado via storage!');
+      if (capturedToken) console.log('[auth] ✅ Token via localStorage/sessionStorage');
     }
 
-    // Captura cookies da sessão (fallback se não tiver JWT)
-    const cookies = await context.cookies();
-    SESSION.cookies = cookies;
-
+    // Estratégia 4: chama o endpoint de auth direto da página (com os cookies já estabelecidos)
     if (!capturedToken) {
-      // Tenta chamar o endpoint de autenticação diretamente com os cookies já estabelecidos
-      capturedToken = await page.evaluate(async (creds) => {
+      console.log('[auth] Tentando chamar authenticate via page.evaluate...');
+      capturedToken = await page.evaluate(async ([user, pass]) => {
         try {
           const r = await fetch('/bnmpportal/api/authenticate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(creds)
+            credentials: 'include',
+            body: JSON.stringify({ username: user, password: pass })
           });
+          if (!r.ok) return null;
           const d = await r.json();
           return d.id_token || d.token || d.access_token || null;
         } catch { return null; }
-      }, { username: u, password: p });
-      if (capturedToken) console.log('[auth] Token capturado via fetch interno!');
+      }, [u, p]);
+      if (capturedToken) console.log('[auth] ✅ Token via fetch interno com cookies de sessão');
     }
 
+    // Estratégia 5: verifica se está logado buscando variável global de auth
     if (!capturedToken) {
-      // Última tentativa: verifica se está logado (page não tem mais login form)
-      const stillOnLogin = await page.$('input[type="password"]');
-      if (stillOnLogin) throw new Error('Login falhou — verifique usuário e senha.');
-      throw new Error('Login realizado mas token não foi capturado. Tente novamente.');
+      capturedToken = await page.evaluate(() => {
+        return (
+          window.__auth_token || window.authToken || window.jwtToken ||
+          window.__token || window.TOKEN || window._token ||
+          (window.angular && angular.element(document.body)?.injector()?.get?.('AuthService')?.getToken?.()) ||
+          null
+        );
+      }).catch(() => null);
+      if (capturedToken) console.log('[auth] ✅ Token via variável global');
+    }
+
+    // Captura os cookies da sessão (para uso como fallback)
+    SESSION.cookies = await context.cookies();
+
+    if (!capturedToken) {
+      // Verifica se saiu da tela de login (indica sucesso mesmo sem token capturado)
+      const stillLogin = await page.$('input[type="password"]');
+      if (stillLogin) {
+        throw new Error('Login falhou — usuário ou senha incorretos.');
+      }
+      throw new Error('Login realizado mas token não capturado. Tente novamente ou entre em contato com o suporte.');
     }
 
     SESSION.token = capturedToken;
     SESSION.expiresAt = Date.now() + 3_600_000; // 1 hora
-    console.log('[auth] Login concluído com sucesso!');
+    console.log('[auth] ✅ Login concluído com sucesso!');
     return capturedToken;
 
   } finally {
@@ -190,19 +278,22 @@ async function login(username, password) {
 }
 
 /**
- * Retorna headers prontos para chamar a API do CNJ.
+ * Retorna headers autenticados, renovando o token se necessário.
  */
 async function getHeaders() {
   if (!isValid()) {
-    await login();
+    const u = SESSION.credentials.username;
+    const p = SESSION.credentials.password;
+    if (!u || !p) throw new Error('Credenciais não configuradas. Configure na aba Configurações do painel.');
+    await login(u, p);
   }
   return {
     'Authorization': `Bearer ${SESSION.token}`,
     'Accept': 'application/json',
     'Content-Type': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Origin': 'https://portalbnmp.cnj.jus.br',
-    'Referer': 'https://portalbnmp.cnj.jus.br/'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Origin': PORTAL_URL,
+    'Referer': `${PORTAL_URL}/bnmpportal/`
   };
 }
 

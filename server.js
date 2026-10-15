@@ -206,9 +206,9 @@ router.post('/mandado/:id/efetuar', async (req, res) => {
 // --- PDF / Documento de um mandado ---
 router.get('/mandado/:id/pdf', async (req, res) => {
   try {
-    const token = await getToken();
+    const headers = await auth.getHeaders();
     const r = await fetch(`${BNMP_BASE_URL}/pecas/${req.params.id}/pdf`, {
-      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/pdf' }
+      headers: { ...headers, 'Accept': 'application/pdf,application/octet-stream,*/*' }
     });
 
     if (!r.ok) return res.status(r.status).json({ error: `Erro ao buscar PDF: ${r.status}` });
