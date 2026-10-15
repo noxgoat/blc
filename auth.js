@@ -40,7 +40,22 @@ async function login(username, password) {
 
   console.log('[auth] Iniciando login via Playwright...');
 
-  const browser = await chromium.launch({
+  // Detecta caminho do Chromium em diferentes ambientes (Render, local, etc.)
+  const fs = require('fs');
+  const possiblePaths = [
+    process.env.PLAYWRIGHT_EXECUTABLE_PATH,
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ].filter(Boolean);
+
+  let executablePath;
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) { executablePath = p; break; }
+  }
+
+  const launchOpts = {
     headless: true,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
@@ -48,7 +63,13 @@ async function login(username, password) {
       '--disable-blink-features=AutomationControlled',
       '--window-size=1280,800'
     ]
-  });
+  };
+  if (executablePath) {
+    launchOpts.executablePath = executablePath;
+    console.log('[auth] Usando Chromium:', executablePath);
+  }
+
+  const browser = await chromium.launch(launchOpts);
 
   try {
     const context = await browser.newContext({
