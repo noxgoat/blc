@@ -2,12 +2,17 @@ services:
   - type: web
     name: bnmp-backend
     runtime: node
-    buildCommand: npm install && npx playwright install chromium --with-deps
+    buildCommand: >
+      apt-get update -y &&
+      apt-get install -y chromium chromium-driver &&
+      npm install
     startCommand: npm start
     envVars:
       - key: PORT
         value: 3000
       - key: NODE_ENV
         value: production
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /root/.cache/ms-playwright
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "1"
+      - key: CHROMIUM_PATH
+        value: /usr/bin/chromium
