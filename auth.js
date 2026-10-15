@@ -40,36 +40,50 @@ async function login(username, password) {
 
   console.log('[auth] Iniciando login via Playwright...');
 
-  // Detecta caminho do Chromium em diferentes ambientes (Render, local, etc.)
+  const { execSync } = require('child_process');
   const fs = require('fs');
-  const possiblePaths = [
-    process.env.PLAYWRIGHT_EXECUTABLE_PATH,
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-  ].filter(Boolean);
 
-  let executablePath;
-  for (const p of possiblePaths) {
-    if (fs.existsSync(p)) { executablePath = p; break; }
+  // Encontra o Chromium instalado pelo Playwright dinamicamente
+  function findChromium() {
+    // 1. Env var explícita
+    if (process.env.PLAYWRIGHT_EXECUTABLE_PATH && fs.existsSync(process.env.PLAYWRIGHT_EXECUTABLE_PATH)) {
+      return process.env.PLAYWRIGHT_EXECUTABLE_PATH;
+    }
+    // 2. Busca nos caminhos conhecidos do Playwright (~/.cache ou /root/.cache)
+    const baseDirs = [
+      '/root/.cache/ms-playwright',
+      '/home/user/.cache/ms-playwright',
+      process.env.HOME ? `${process.env.HOME}/.cache/ms-playwright` : null,
+    ].filter(Boolean);
+
+    for (const base of baseDirs) {
+      if (!fs.existsSync(base)) continue;
+      // Varre subdiretórios procurando o executável
+      try {
+        const result = execSync(`find "${base}" -name "chrome-headless-shell" -o -name "chromium" -o -name "chrome" 2>/dev/null | head -1`, { encoding: 'utf8' }).trim();
+        if (result && fs.existsSync(result)) return result;
+      } catch {}
+    }
+    // 3. Binários do sistema
+    for (const p of ['/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/bin/google-chrome']) {
+      if (fs.existsSync(p)) return p;
+    }
+    return null; // Deixa o Playwright usar o padrão dele
   }
 
-  const launchOpts = {
+  const executablePath = findChromium();
+  console.log('[auth] Chromium encontrado em:', executablePath || '(padrão do Playwright)');
+
+  const browser = await chromium.launch({
     headless: true,
+    executablePath: executablePath || undefined,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
       '--disable-blink-features=AutomationControlled',
       '--window-size=1280,800'
     ]
-  };
-  if (executablePath) {
-    launchOpts.executablePath = executablePath;
-    console.log('[auth] Usando Chromium:', executablePath);
-  }
-
-  const browser = await chromium.launch(launchOpts);
+  });
 
   try {
     const context = await browser.newContext({
